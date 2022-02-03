@@ -1,6 +1,6 @@
 /*
 *	Vote Mode
-*	Copyright (C) 2021 Silvers
+*	Copyright (C) 2022 Silvers
 *
 *	This program is free software: you can redistribute it and/or modify
 *	it under the terms of the GNU General Public License as published by
@@ -18,7 +18,7 @@
 
 
 
-#define PLUGIN_VERSION		"1.6"
+#define PLUGIN_VERSION		"1.7"
 
 /*======================================================================================
 	Plugin Info:
@@ -31,6 +31,9 @@
 
 ========================================================================================
 	Change Log:
+
+1.7 (15-Jan-2022)
+	- Added cvar "l4d_votemode_reset" to reset the gamemode when the server is empty. Requested by "NoroHime".
 
 1.6 (04-Dec-2021)
 	- Changes to fix warnings when compiling on SourceMod 1.11.
@@ -86,9 +89,10 @@
 
 
 // Cvar handles and variables
-ConVar g_hCvarAdmin, g_hCvarMenu, g_hCvarRestart, g_hCvarTimeout;
+ConVar g_hCvarAdmin, g_hCvarMenu, g_hCvarReset, g_hCvarRestart, g_hCvarTimeout;
 int g_iCvarAdmin, g_iCvarRestart;
 float g_fCvarTimeout;
+char g_sCvarReset[64];
 
 // Other handles
 ConVar g_hMPGameMode, g_hRestartGame;
@@ -168,6 +172,7 @@ public void OnPluginStart()
 
 	g_hCvarMenu =		CreateConVar(	"l4d_votemode_admin_menu",		"1", 			"0=No, 1=Display in the Server Commands of admin menu.", CVAR_FLAGS );
 	g_hCvarAdmin =		CreateConVar(	"l4d_votemode_admin_flag",		"", 			"Players with these flags can vote to change the game mode.", CVAR_FLAGS );
+	g_hCvarReset =		CreateConVar(	"l4d_votemode_reset",			"coop",			"Specify the gamemode to reset when all players have disconnected. Empty string = Don't reset.", CVAR_FLAGS );
 	g_hCvarRestart =	CreateConVar(	"l4d_votemode_restart",			"1",			"0=No restart, 1=With 'changelevel' command, 2=Restart map with 'mp_restartgame' cvar.", CVAR_FLAGS );
 	g_hCvarTimeout =	CreateConVar(	"l4d_votemode_timeout",			"30.0",			"How long the vote should be visible.", CVAR_FLAGS, true, 5.0, true, 60.0 );
 	CreateConVar(						"l4d_votemode_version",			PLUGIN_VERSION, "Vote Mode plugin version.", FCVAR_NOTIFY|FCVAR_DONTRECORD);
@@ -175,6 +180,7 @@ public void OnPluginStart()
 
 	GetCvars();
 	g_hCvarAdmin.AddChangeHook(ConVarChanged_Cvars);
+	g_hCvarReset.AddChangeHook(ConVarChanged_Cvars);
 	g_hCvarRestart.AddChangeHook(ConVarChanged_Cvars);
 	g_hCvarTimeout.AddChangeHook(ConVarChanged_Cvars);
 
@@ -188,6 +194,8 @@ public void OnPluginStart()
 		OnAdminMenuReady(topmenu);
 
 	LoadConfig();
+
+	HookEvent("player_disconnect", Event_Disconnect);	
 }
 
 
@@ -241,8 +249,31 @@ void GetCvars()
 	char sTemp[16];
 	g_hCvarAdmin.GetString(sTemp, sizeof(sTemp));
 	g_iCvarAdmin = ReadFlagString(sTemp);
+	g_hCvarReset.GetString(g_sCvarReset, sizeof(g_sCvarReset));
 	g_iCvarRestart = g_hCvarRestart.IntValue;
 	g_fCvarTimeout = g_hCvarTimeout.FloatValue;
+}
+
+public Action Event_Disconnect(Event event, const char[] name, bool dontBroadcast)
+{
+	if( g_sCvarReset[0] )
+	{
+		char sMap[64];
+		g_hMPGameMode.GetString(sMap, sizeof(sMap));
+		if( strcmp(sMap, g_sCvarReset) )
+		{
+			for( int i = 1; i <= MaxClients; i++ )
+			{
+				if( IsClientConnected(i) && !IsFakeClient(i) )
+					return;
+			}
+
+			g_hMPGameMode.SetString(g_sCvarReset);
+
+			GetCurrentMap(sMap, sizeof(sMap));
+			ServerCommand("z_difficulty normal; changelevel %s", sMap);
+		}
+	}
 }
 
 
