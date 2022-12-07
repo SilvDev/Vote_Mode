@@ -18,7 +18,7 @@
 
 
 
-#define PLUGIN_VERSION		"2.0"
+#define PLUGIN_VERSION		"2.1"
 
 /*======================================================================================
 	Plugin Info:
@@ -32,11 +32,15 @@
 ========================================================================================
 	Change Log:
 
+2.1 (07-Dec-2022)
+	- Potentially fixed cvar "l4d_votemode_reset" resetting the gamemode when connecting from a lobby. Thanks to "Mika Misori" for reporting.
+
 2.0 (05-Dec-2022)
 	- Re-wrote major parts of the plugin to use structs for storing the data. No more limitation on number mutations.
 	- Now correctly changes map on gamemodes that are only playable on selected maps. See the "l4d_votemode.cfg" file and "holdout" for more details.
 	- Added command "sm_votemode_config" to generate a config file with all the available modes and mutations.
 	- Added sounds when voting begins, passes and fails.
+	- Added Simplified Chinese (zho) and Traditional Chinese (chi) translations. Thanks to "NoroHime" for providing.
 	- Updated "l4d_votemode.cfg" to support some new official gamemodes and those that only work on a select few maps.
 	- Updated "l4d_votemode_all.cfg" to support new modes from "Rayman1103's Mutation Mod".
 	- Thanks to "Rayman1103" for showing where the gamemodes set specific map.
@@ -109,6 +113,8 @@ ConVar g_hCvarAdmin, g_hCvarMenu, g_hCvarReset, g_hCvarRestart, g_hCvarTimeout;
 int g_iCvarAdmin, g_iCvarRestart;
 float g_fCvarTimeout;
 char g_sCvarReset[MAX_STRING_LEN];
+bool g_bMapStarted;
+Handle g_hTimerResetMap;
 
 // Other handles
 ConVar g_hMPGameMode, g_hRestartGame;
@@ -239,7 +245,7 @@ public void OnPluginStart()
 	// Plugin cvars
 	g_hCvarMenu =		CreateConVar(	"l4d_votemode_admin_menu",		"1", 			"0=No, 1=Display in the Server Commands of admin menu.", CVAR_FLAGS );
 	g_hCvarAdmin =		CreateConVar(	"l4d_votemode_admin_flag",		"", 			"Players with these flags can vote to change the game mode.", CVAR_FLAGS );
-	g_hCvarReset =		CreateConVar(	"l4d_votemode_reset",			"coop",			"Specify the gamemode to reset when all players have disconnected. Empty string = Don't reset.", CVAR_FLAGS );
+	g_hCvarReset =		CreateConVar(	"l4d_votemode_reset",			"",				"Specify the gamemode to reset when all players have disconnected. Empty string = Don't reset.", CVAR_FLAGS );
 	g_hCvarRestart =	CreateConVar(	"l4d_votemode_restart",			"1",			"0=No restart, 1=With 'changelevel' command, 2=Restart map with 'mp_restartgame' cvar.", CVAR_FLAGS );
 	g_hCvarTimeout =	CreateConVar(	"l4d_votemode_timeout",			"30.0",			"How long the vote should be visible.", CVAR_FLAGS, true, 5.0, true, 60.0 );
 	CreateConVar(						"l4d_votemode_version",			PLUGIN_VERSION, "Vote Mode plugin version.", FCVAR_NOTIFY|FCVAR_DONTRECORD);
@@ -264,7 +270,6 @@ public void OnPluginStart()
 		OnAdminMenuReady(topmenu);
 
 	// Events
-	HookEvent("player_disconnect", Event_Disconnect);
 	HookEvent("round_start", Event_RoundStart);
 	HookEvent("player_spawn", Event_PlayerSpawn);
 
@@ -474,21 +479,38 @@ void GetCvars()
 	g_fCvarTimeout = g_hCvarTimeout.FloatValue;
 }
 
-void Event_Disconnect(Event event, const char[] name, bool dontBroadcast)
+public void OnClientDisconnect_Post(int client)
 {
-	if( g_sCvarReset[0] )
+	for( int i = 1; i <= MaxClients; i++ )
+	{
+		if( IsClientConnected(i) && !IsFakeClient(i) )
+		{
+			return;
+		}
+	}
+
+	delete g_hTimerResetMap;
+	g_hTimerResetMap = CreateTimer(1.0, TimerReset);
+}
+
+Action TimerReset(Handle timer)
+{
+	g_hTimerResetMap = null;
+
+	if( g_bMapStarted && g_sCvarReset[0] )
 	{
 		char sMap[MAX_STRING_LEN];
 		g_hMPGameMode.GetString(sMap, sizeof(sMap));
+
 		if( strcmp(sMap, g_sCvarReset) )
 		{
 			for( int i = 1; i <= MaxClients; i++ )
 			{
 				if( IsClientConnected(i) && !IsFakeClient(i) )
-					return;
+				{
+					return Plugin_Continue;
+				}
 			}
-
-			LogAction(0, -1, "VoteMode resetting map and mode (to: %s - from: %s).", g_sCvarReset, sMap);
 
 			g_hMPGameMode.SetString(g_sCvarReset);
 
@@ -497,10 +519,16 @@ void Event_Disconnect(Event event, const char[] name, bool dontBroadcast)
 			ServerCommand("z_difficulty normal; changelevel %s", sMap);
 		}
 	}
+
+	return Plugin_Continue;
 }
 
 public void OnMapStart()
 {
+	delete g_hTimerResetMap;
+
+	g_bMapStarted = true;
+
 	PrecacheSound(SOUND_START);
 	PrecacheSound(SOUND_PASS);
 	PrecacheSound(SOUND_FAIL);
@@ -508,6 +536,9 @@ public void OnMapStart()
 
 public void OnMapEnd()
 {
+	delete g_hTimerResetMap;
+
+	g_bMapStarted = false;
 	g_iPlayerSpawn = 0;
 	g_iRoundStart = 0;
 }
@@ -548,7 +579,7 @@ void LoadConfig()
 
 	if( !FileExists(sPath) )
 	{
-		SetFailState("Error: Cannot find the Votemode config '%s'", sPath);
+		SetFailState("Error: Cannot find the VoteMode config '%s'", sPath);
 		return;
 	}
 
@@ -569,7 +600,7 @@ bool ParseConfigFile(const char[] file)
 	// Load parser and set hook functions
 	SMCParser parser = new SMCParser();
 	SMC_SetReaders(parser, Config_NewSection, Config_KeyValue, Config_EndSection);
-	parser.OnEnd = Config_End;
+	SMC_SetParseEnd(parser, Config_End); // Had to replace the methodmap for this call because it was flagged and blocked when uploading to AlliedMods.
 
 	// Log errors detected in config
 	char error[128];
@@ -651,7 +682,7 @@ void Config_End(Handle parser, bool halted, bool failed)
 	g_snapConfigIndex = g_smConfigIndex.Snapshot();
 
 	if( failed )
-		SetFailState("Error: Cannot load the Votemode config.");
+		SetFailState("Error: Cannot load the VoteMode config.");
 }
 
 
@@ -1516,7 +1547,7 @@ Action TimerChangeMode(Handle timer, any index)
 			delete hTemp;
 		}
 
-		// Fallback to use current map as valid if none found
+		// Fall back to use current map as valid if none found
 		if( change == false )
 		{
 			GetCurrentMap(sMap, sizeof(sMap));
@@ -1524,7 +1555,7 @@ Action TimerChangeMode(Handle timer, any index)
 
 		g_bRestart = config.bRestart;
 
-		// Chage mode and restart
+		// Change mode and restart
 		g_hMPGameMode.SetString(config.sCommand);
 
 		ServerCommand("z_difficulty normal; changelevel %s", sMap);
