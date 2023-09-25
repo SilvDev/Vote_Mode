@@ -1,6 +1,6 @@
 /*
 *	Vote Mode
-*	Copyright (C) 2022 Silvers
+*	Copyright (C) 2023 Silvers
 *
 *	This program is free software: you can redistribute it and/or modify
 *	it under the terms of the GNU General Public License as published by
@@ -18,7 +18,7 @@
 
 
 
-#define PLUGIN_VERSION		"2.1"
+#define PLUGIN_VERSION		"2.2"
 
 /*======================================================================================
 	Plugin Info:
@@ -31,6 +31,12 @@
 
 ========================================================================================
 	Change Log:
+
+2.2 (25-Sep-2023)
+	- Added 0.1 second delay between changing mode and switching map, to allow other plugins to detect mode change. Thanks to "Alex101192" for reporting.
+	- Changed cvar "l4d_votemode_restart" to remove round restart method. Will default to changelevel method.
+	- This is to prevent errors with various mutations that need a full map change in order to work correctly.
+	- Update is from February 2023 but never published. Thanks to "Alex101192" for testing back then.
 
 2.1 (07-Dec-2022)
 	- Potentially fixed cvar "l4d_votemode_reset" resetting the gamemode when connecting from a lobby. Thanks to "Mika Misori" for reporting.
@@ -132,7 +138,8 @@ int g_iChangeModeTo, g_iSelected[MAXPLAYERS+1];
 int g_iModesCount, g_iConfigLevel, g_iModeIndex[64];
 
 // Valid maps for modes
-StringMap g_smModes; // FIXME, delete
+StringMap g_smModes;
+char g_sMap[MAX_STRING_LEN];
 
 // Used to restart the round after loading a new map, to fix issues with some modes not loading correctly
 int g_iPlayerSpawn, g_iRoundStart;
@@ -141,14 +148,6 @@ bool g_bRestart;
 // Used to find valid maps when switching mode (method A)
 native void InfoEditor_GetString(int pThis, const char[] keyname, char[] dest, int destLen);
 bool g_bInfoEditor;
-
-// Data storage
-ConfigData g_hConfigData;				// Temporary store when loading the "l4d_votemode.cfg" file from LoadConfig
-ArrayList g_alConfigSections;			// Section names, used for first menu entry titles
-
-StringMap g_smConfigData;				// Using an index as key, stores the "l4d_votemode.cfg" data
-StringMap g_smConfigIndex;				// Using the game mode as key, stores the related index used in g_smConfigData
-StringMapSnapshot g_snapConfigIndex;	// A snapshot of the g_smConfigIndex StringMap to find a game mode by index
 
 // Stores the "l4d_votemode.cfg" data - used for menus and everything else
 enum struct ConfigData
@@ -185,6 +184,14 @@ enum struct MissionData
 		this.alName.PushString(sName);
 	}
 }
+
+// Data storage
+ConfigData g_hConfigData;				// Temporary store when loading the "l4d_votemode.cfg" file from LoadConfig
+ArrayList g_alConfigSections;			// Section names, used for first menu entry titles
+
+StringMap g_smConfigData;				// Using an index as key, stores the "l4d_votemode.cfg" data
+StringMap g_smConfigIndex;				// Using the game mode as key, stores the related index used in g_smConfigData
+StringMapSnapshot g_snapConfigIndex;	// A snapshot of the g_smConfigIndex StringMap to find a game mode by index
 
 
 
@@ -246,7 +253,7 @@ public void OnPluginStart()
 	g_hCvarMenu =		CreateConVar(	"l4d_votemode_admin_menu",		"1", 			"0=No, 1=Display in the Server Commands of admin menu.", CVAR_FLAGS );
 	g_hCvarAdmin =		CreateConVar(	"l4d_votemode_admin_flag",		"", 			"Players with these flags can vote to change the game mode.", CVAR_FLAGS );
 	g_hCvarReset =		CreateConVar(	"l4d_votemode_reset",			"",				"Specify the gamemode to reset when all players have disconnected. Empty string = Don't reset.", CVAR_FLAGS );
-	g_hCvarRestart =	CreateConVar(	"l4d_votemode_restart",			"1",			"0=No restart, 1=With 'changelevel' command, 2=Restart map with 'mp_restartgame' cvar.", CVAR_FLAGS );
+	g_hCvarRestart =	CreateConVar(	"l4d_votemode_restart",			"1",			"0=No restart, 1=With 'changelevel' command.", CVAR_FLAGS );
 	g_hCvarTimeout =	CreateConVar(	"l4d_votemode_timeout",			"30.0",			"How long the vote should be visible.", CVAR_FLAGS, true, 5.0, true, 60.0 );
 	CreateConVar(						"l4d_votemode_version",			PLUGIN_VERSION, "Vote Mode plugin version.", FCVAR_NOTIFY|FCVAR_DONTRECORD);
 	AutoExecConfig(true, 				"l4d_votemode");
@@ -489,8 +496,11 @@ public void OnClientDisconnect_Post(int client)
 		}
 	}
 
-	delete g_hTimerResetMap;
-	g_hTimerResetMap = CreateTimer(1.0, TimerReset);
+	if( g_sCvarReset[0] )
+	{
+		delete g_hTimerResetMap;
+		g_hTimerResetMap = CreateTimer(1.0, TimerReset);
+	}
 }
 
 Action TimerReset(Handle timer)
@@ -516,7 +526,12 @@ Action TimerReset(Handle timer)
 
 			GetCurrentMap(sMap, sizeof(sMap));
 
-			ServerCommand("z_difficulty normal; changelevel %s", sMap);
+			// ServerCommand("z_difficulty normal; changelevel %s", sMap);
+			ServerCommand("z_difficulty normal");
+			ServerExecute();
+
+			strcopy(g_sMap, sizeof(g_sMap), sMap);
+			CreateTimer(0.1, TimerChangeLevel);
 		}
 	}
 
@@ -1413,7 +1428,8 @@ void VoteCompleted()
 // ====================================================================================================
 void ChangeGameModeTo(int iMode)
 {
-	CreateTimer(3.0, TimerChangeMode, iMode);
+	if( g_iCvarRestart != 0 )
+		CreateTimer(3.0, TimerChangeMode, iMode);
 
 	char sTemp[4];
 	ConfigData data;
@@ -1432,139 +1448,141 @@ void ChangeGameModeTo(int iMode)
 	}
 }
 
-Action TimerChangeMode(Handle timer, any index)
+Action TimerChangeMode(Handle timer, int index)
 {
 	// Change map
-	if( g_iCvarRestart == 1 )
+	bool change;
+	char sMap[MAX_STRING_LEN];
+	char sTemp[MAX_STRING_LEN];
+
+	// Load config for mode
+	IntToString(index, sTemp, sizeof(sTemp));
+
+	ConfigData config;
+
+	g_smConfigData.GetArray(sTemp, config, sizeof(config));
+
+
+
+	// 1. Validate mode and maps from mission.txt files
+	// Match current map "name" to other valid map names for the mode
+	if( change == false )
 	{
-		// Current map
-		bool change;
-		char sMap[MAX_STRING_LEN];
-		char sTemp[MAX_STRING_LEN];
+		ArrayList aList = new ArrayList(ByteCountToCells(MAX_STRING_LEN));
+		int len;
 
-		// Load config for mode
-		IntToString(index, sTemp, sizeof(sTemp));
-
-		ConfigData config;
-
-		g_smConfigData.GetArray(sTemp, config, sizeof(config));
-
-
-
-		// 1. Validate mode and maps from mission.txt files
-		// Match current map "name" to other valid map names for the mode
-		if( change == false )
+		// Check if the mode from "l4d_votemode.cfg" is using the ":" separator to specify valid maps
+		// Lookup current mode for valid maps
+		if( config.sName[0] )
 		{
-			ArrayList aList = new ArrayList(ByteCountToCells(MAX_STRING_LEN));
-			int len;
+			// Get list of modes
+			MissionData mission;
 
-			// Check if the mode from "l4d_votemode.cfg" is using the ":" separator to specify valid maps
-			// Lookup current mode for valid maps
-			if( config.sName[0] )
+			if( g_smMissionData.GetArray(config.sCommand, mission, sizeof(mission)) )
 			{
-				// Get list of modes
-				MissionData mission;
+				int lenMaps;
 
-				if( g_smMissionData.GetArray(config.sCommand, mission, sizeof(mission)) )
+				lenMaps = mission.alMaps.Length;
+
+				// Find current map, and get "name"
+				for( int i = 0; i < lenMaps; i++ )
 				{
-					int lenMaps;
+					mission.alMaps.GetString(i, sMap, sizeof(sMap));
+					mission.alName.GetString(i, sTemp, sizeof(sTemp));
 
-					lenMaps = mission.alMaps.Length;
-
-					// Find current map, and get "name"
-					for( int i = 0; i < lenMaps; i++ )
+					// Match the "name" between mission.txt and l4d_votemode.cfg
+					if( strcmp(config.sName, sTemp) == 0 )
 					{
-						mission.alMaps.GetString(i, sMap, sizeof(sMap));
-						mission.alName.GetString(i, sTemp, sizeof(sTemp));
-
-						// Match the "name" between mission.txt and l4d_votemode.cfg
-						if( strcmp(config.sName, sTemp) == 0 )
-						{
-							aList.PushString(sMap);
-						}
-					}
-
-					// Select random valid map
-					len = aList.Length;
-					if( len )
-					{
-						aList.GetString(GetRandomInt(0, len - 1), sMap, sizeof(sMap));
-						change = true;
+						aList.PushString(sMap);
 					}
 				}
-			}
-		}
 
-
-
-		// 2. Verify valid mode for the current map/campaign with "Info Editor" plugin
-		// Search the voted mode for valid maps
-		if( change == false && g_bInfoEditor )
-		{
-			// Validate mode for current campaign
-			int done;
-			ArrayList hTemp;
-			char sNews[MAX_STRING_LEN];
-
-			hTemp = new ArrayList(ByteCountToCells(MAX_STRING_LEN));
-
-			GetCurrentMap(sMap, sizeof(sMap));
-
-			// Loop valid maps from mission file
-			for( int i = 1; i < 15; i++ )
-			{
-				Format(sTemp, sizeof(sTemp), "modes/%s/%d/map", config.sCommand, i);
-				InfoEditor_GetString(0, sTemp, sNews, sizeof(sNews));
-
-				if( strcmp(sNews, "N/A") == 0 )			// Doesn't exist
+				// Select random valid map
+				len = aList.Length;
+				if( len )
 				{
-					break;
-				}
-				else if( strcmp(sNews, sMap) == 0 )		// Same as current map
-				{
-					change = true;
-					done = 1;
-					break;
-				}
-				else if( sNews[0] ) // Not empty string
-				{
-					hTemp.PushString(sNews);			// Store valid maps
-				}
-			}
-
-			// Not same map
-			if( !done )
-			{
-				// Get random valid map
-				done = hTemp.Length;
-				if( done )
-				{
-					hTemp.GetString(GetRandomInt(0, done-1), sMap, sizeof(sMap));
+					aList.GetString(GetRandomInt(0, len - 1), sMap, sizeof(sMap));
 					change = true;
 				}
 			}
-
-			delete hTemp;
 		}
-
-		// Fall back to use current map as valid if none found
-		if( change == false )
-		{
-			GetCurrentMap(sMap, sizeof(sMap));
-		}
-
-		g_bRestart = config.bRestart;
-
-		// Change mode and restart
-		g_hMPGameMode.SetString(config.sCommand);
-
-		ServerCommand("z_difficulty normal; changelevel %s", sMap);
 	}
-	else if( g_iCvarRestart == 2 )
+
+
+
+	// 2. Verify valid mode for the current map/campaign with "Info Editor" plugin
+	// Search the voted mode for valid maps
+	if( change == false && g_bInfoEditor )
 	{
-		g_hRestartGame.IntValue = 1;
-		CreateTimer(0.1, TimerRestartGame);
+		// Validate mode for current campaign
+		int done;
+		ArrayList hTemp;
+		char sNews[MAX_STRING_LEN];
+
+		hTemp = new ArrayList(ByteCountToCells(MAX_STRING_LEN));
+
+		GetCurrentMap(sMap, sizeof(sMap));
+
+		// Loop valid maps from mission file
+		for( int i = 1; i < 15; i++ )
+		{
+			Format(sTemp, sizeof(sTemp), "modes/%s/%d/map", config.sCommand, i);
+			InfoEditor_GetString(0, sTemp, sNews, sizeof(sNews));
+
+			if( strcmp(sNews, "N/A") == 0 )			// Doesn't exist
+			{
+				break;
+			}
+			else if( strcmp(sNews, sMap) == 0 )		// Same as current map
+			{
+				change = true;
+				done = 1;
+				break;
+			}
+			else if( sNews[0] ) // Not empty string
+			{
+				hTemp.PushString(sNews);			// Store valid maps
+			}
+		}
+
+		// Not same map
+		if( !done )
+		{
+			// Get random valid map
+			done = hTemp.Length;
+			if( done )
+			{
+				hTemp.GetString(GetRandomInt(0, done-1), sMap, sizeof(sMap));
+				change = true;
+			}
+		}
+
+		delete hTemp;
 	}
+
+	// Fall back to use current map as valid if none found
+	if( change == false )
+	{
+		GetCurrentMap(sMap, sizeof(sMap));
+	}
+
+	g_bRestart = config.bRestart;
+
+	// Change mode and restart
+	g_hMPGameMode.SetString(config.sCommand);
+
+	strcopy(g_sMap, sizeof(g_sMap), sMap);
+	CreateTimer(0.1, TimerChangeLevel);
+
+	return Plugin_Continue;
+}
+
+Action TimerChangeLevel(Handle timer)
+{
+	// ServerCommand("z_difficulty normal; changelevel %s", g_sMap);
+	ServerCommand("z_difficulty normal");
+	ServerExecute();
+	ForceChangeLevel(g_sMap, "VoteMode");
 
 	return Plugin_Continue;
 }
